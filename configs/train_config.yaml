@@ -1,0 +1,172 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# KelpSegmentation — Training Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# Run:  python src/train.py --config configs/train_config.yaml
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  # Glob pattern that expands to scene folders (each folder contains images/ masks/).
+  # Example: "/data/Annotated/G0512Stride256RevisedOnly10Scenes_BoPsSubstrate_combined/*"
+  data_root: "C:/Annotated Dataset/L2A Data/G0512Stride256Revised_4noBathyNoSubsModel/*"
+
+  # ── Split strategy ──────────────────────────────────────────────────────────
+  # Choose one of: "geographic" | "random" | "loo"
+  split_strategy: "random"
+
+  # geographic: shuffle folders, split by folder (preserves geographic independence)
+  geographic:
+    train_frac: 0.70
+    val_frac:   0.15
+    # test receives the remainder
+
+  # random: pool all tiles and split at tile level (use when you want max data for training to get the best model, in which case set 0.0015 for val_frac and test_frac)
+  random:
+    val_frac:  0.0015
+    test_frac: 0.0015
+
+  # loo (leave-one-out): hold out specific scene folders as test; This can be multiple folders so leave ONE out is perhaps not the best name
+  # remaining folders' tiles are split train/val at tile level.
+  # Folder order for 10-scene dataset:
+  #   0:uws  1:uxr  2:uxq  3:uyq  4:ucu  5:uxs  6:uca  7:uwt  8:udu  9:uuu
+  loo:
+    test_indices: [3]     # e.g. [9,1,3] or [0,2,6]
+    val_frac: 0.20        # fraction of remaining tiles held out for val
+
+  random_seed: 42
+
+  # ── Channels ────────────────────────────────────────────────────────────────
+  # Which raw bands to load from the TIFF (in this order).
+  # Available: blue, green, red, nir, rededge, substrate, bathymetry, slope
+  band_names:
+    - blue
+    - green
+    - red
+    - nir
+    - rededge
+    #- substrate
+    #- bathymetry
+    #- slope
+
+  # Which vegetation indices to compute and append after the raw bands.
+  # Available: ndvi, ndwi, gndvi, clgreen, ndvire
+  vi_names:
+    - ndvi
+    - ndwi
+    - gndvi
+    - clgreen
+    - ndvire
+
+  # If true, compute mean/std from training data before training (recommended).
+  # If false, supply precomputed_mean / precomputed_std below.
+  compute_mean_std: true
+
+  # Precomputed normalization stats — only used when compute_mean_std: false.
+  # Length must equal len(band_names) + len(vi_names).
+  # precomputed_mean: [145.0, 120.0, 100.0, 180.0, 130.0, 1.5, -10.0, 5.0, 0.1, -0.1, 0.05, 5.0, 0.2]
+  # precomputed_std:  [ 30.0,  25.0,  22.0,  40.0,  28.0, 0.8,  50.0, 2.0, 0.2,  0.3, 0.15, 8.0, 0.3]
+
+  # DataLoader settings
+  batch_size:  8
+  num_workers: 8
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  # Any smp architecture: Unet, UnetPlusPlus, DeepLabV3Plus, FPN, PSPNet, …
+  architecture:    "Unet"
+  # Any smp encoder: tu-maxvit_tiny_tf_512, resnet18, resnet50, efficientnet-b0, …
+  encoder:         "tu-maxvit_tiny_tf_512"
+  # Pre-trained encoder weights. Use null for no pre-training (required for
+  # non-standard in_channels that don't match imagenet's 3 channels).
+  encoder_weights: null
+  # Binary segmentation → always 1.
+  out_classes: 1
+  # in_channels is computed automatically from band_names + vi_names.
+  # Override here only if you need to hard-code a specific value.
+  # in_channels: 13
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs:        50
+  lr:            0.0002
+  eta_min:       0.00001      # CosineAnnealingLR minimum LR
+  weight_decay:  0.0001
+  optimizer:     "adam"       # "adam" or "adamw"
+  patience:      10           # early stopping patience (monitored: valid_kelp_per_image_iou)
+
+  # ── Loss ──────────────────────────────────────────────────────────────────
+  # Options: dice | bce_dice | tversky | jaccard | focal_dice
+  loss: "dice"
+  # Extra loss kwargs (only relevant for some losses)
+  bce_weight:    0.5          # for bce_dice
+  dice_weight:   0.5          # for bce_dice
+  tversky_alpha: 0.5          # for tversky  (α > β → penalise FP more)
+  tversky_beta:  0.5          # for tversky  (β > α → penalise FN more)
+
+  # Sigmoid threshold for binary prediction during metric computation.
+  threshold: 0.5
+
+  # Use mixed precision ("medium" or "high") — helps on Ampere+ GPUs.
+  float32_matmul_precision: "medium"
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+# See src/transforms.py for notes on which transforms are safe.
+augmentation:
+  hflip_p:    0.5
+  vflip_p:    0.5
+  rotate90_p: 0.5
+  affine_p:   0.3
+
+# ── Checkpoints ───────────────────────────────────────────────────────────────
+checkpoints:
+  dir:      "checkpoints"     # relative to repo root; gitignored
+  monitor:  "valid_kelp_per_image_iou"
+  mode:     "max"             # save when monitored metric improves
+  # Enable checkpointing only in the last N epochs (set 0 to always checkpoint)
+  save_last_n_epochs: 0
+
+# ── Fine-tuning ───────────────────────────────────────────────────────────────
+# Set enabled: true to initialise the model from a pre-trained checkpoint
+# instead of random weights.  All other training settings (epochs, lr,
+# augmentation, data split, …) apply as normal.
+#
+# When to use fine-tuning vs. training from scratch
+# ──────────────────────────────────────────────────
+# Fine-tune (enabled: true) when:
+#   • You have a new geographic region with limited labelled data.
+#   • The new sensor and spectral bands match the original training data.
+#   • You want faster convergence and a better starting point.
+#
+# Train from scratch (enabled: false) when:
+#   • The input channel configuration has changed (different band_names /
+#     vi_names), making the pre-trained weights incompatible.
+#   • You are combining the new data with the original dataset and retraining
+#     on the full pool.
+#   • The new region is spectrally so different that the old weights
+#     are likely to be actively misleading.
+#
+# Recommended fine-tuning settings for a new region:
+#   epochs:   50–100  (fewer than scratch; early stopping usually triggers)
+#   lr:       0.00005 (5× lower than scratch; avoids overwriting learned features)
+#   freeze_encoder: true  (if new dataset is very small, < ~500 tiles)
+finetune:
+  enabled:        false
+
+  # Path to the .ckpt file saved by a previous training run.
+  checkpoint:     "checkpoints/best_model.ckpt"
+
+  # If true, freeze all encoder weights for the first `freeze_epochs` epochs,
+  # then unfreeze and continue training the full network.
+  # Useful when the new dataset is small and you want to avoid over-writing
+  # the rich spectral features learned on the original BC dataset.
+  freeze_encoder:  false
+  freeze_epochs:   10    # only used when freeze_encoder: true
+  
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlflow:
+  experiment_name: "KelpSegmentation"
+  tracking_uri:    "mlruns"   # local folder; change to http://... for remote server
+  run_name:        null       # auto-generated if null
+  log_model:       false      # set true to log the full model artifact (large)
+  tags:
+    project: "kelp-monitoring"
+    dataset: "Sentinel-2"

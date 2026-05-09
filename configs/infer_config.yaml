@@ -1,0 +1,77 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# KelpSegmentation — Inference Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# Run:  python inference.py --config configs/infer_config.yaml
+
+# ── Input / Output ────────────────────────────────────────────────────────────
+inference:
+  # Directory containing sub-folders (one per S2 scene), each of which holds
+  # the multi-band GeoTIFF to run inference on.
+  input_dir:     "C:/Users/mohsenghanbari/Downloads/q"
+  # Suffix appended to each scene-folder name to form the output filename.
+  # e.g. folder "UXQ_20230801" → "UXQ_20230801_kelp_pred.tif"
+  output_suffix: "_kelp_pred_full.tif"
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  architecture:    "Unet"
+  encoder:         "tu-maxvit_tiny_tf_512"
+  encoder_weights: null
+  out_classes:     1
+  # Path to a saved .pth checkpoint
+  checkpoint:     "C:/Users/mohsenghanbari/OneDrive - University of Victoria/Desktop/AllianceJobs/BoPsRFCombinedRev3and4mappedto3/BestModel4fullModelWithBathyWithSubsWithSlopeUsingAll15scenes/results/Unet_tu-maxvit_tiny_tf_512_20260405_081447.ckpt" # "checkpoints/best_epoch=005_valid_kelp_per_image_iou=0.4685.ckpt"
+  
+  # The number of channels, in_channels, is computed automatically from band_names + vi_names. Override here only if you need to hard-code a specific value.
+  # in_channels: 13
+
+# ── Channels ──────────────────────────────────────────────────────────────────
+# Must exactly match what was used during training. The number of channels, in_channels, is computed automatically from band_names + vi_names.
+data:
+  band_names:
+    - blue
+    - green
+    - red
+    - nir
+    - rededge
+    - substrate
+    - bathymetry
+    - slope
+
+  vi_names:
+    - ndvi
+    - ndwi
+    - gndvi
+    - clgreen
+    - ndvire
+
+  # Normalization stats (must match training).
+  # Copy the values printed by train.py at the end of mean/std computation.
+  mean: [ 2.02127847e+02,  2.64991799e+02,  1.45913497e+02,  9.57456953e+02,
+    3.20302883e+02,  1.13833621e+00, -6.30723576e+00,  7.60650406e+00,
+    3.66107438e-02,  1.84492036e-01, -1.84492036e-01,  1.56750584e+00,
+    9.99078992e-02]
+   # e.g. [    193.40855407714844, 253.84078979492188, 143.26016235351562, 1000.0685424804688,
+    #    322.3371887207031, 1.0380581617355347, -6.395328998565674, 7.897634983062744,
+    #   0.08097291737794876, 0.14905019104480743, -0.14905019104480743,1.7419053316116333,0.11241158097982407] 
+  std:     [1.61504107e+02, 2.22303637e+02, 2.03997451e+02, 1.26105656e+03,
+      3.79069759e+02, 1.21233234e+00, 2.35930351e+02, 1.14107889e+01,
+      6.71879776e-01, 7.23202999e-01, 7.23202999e-01, 3.86945642e+00,
+      4.06695959e-01]
+   # e.g. [150.24855041503906,208.6754150390625,202.66212463378906,1272.37744140625,
+    #     375.53485107421875,1.1925238370895386,252.63198852539062,11.971522331237793,
+    # 0.6597864031791687,0.727131724357605,0.727131724357605,4.127506256103516,0.4078011214733124]  
+
+# ── Tiling ────────────────────────────────────────────────────────────────────
+tiling:
+  tile_size:    512
+  # Fraction of tile_size used as overlap between adjacent tiles (0.5–0.9).
+  overlap:      0.70
+  # Number of edge pixels that get down-weighted in the "weighted" and "halo" methods.
+  halo_size:    64
+  # "weighted" (linear-fade weight map averaging) | "halo" (centre-crop) | "max" (element-wise max)
+  method:       "weighted"
+  padding_mode: "reflect"   # "reflect" | "edge" | "constant"
+  batch_size:   8
+
+# ── Threshold ─────────────────────────────────────────────────────────────────
+threshold: 0.5
