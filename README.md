@@ -279,16 +279,8 @@ Several compiled extensions (rasterio, segmentation-models-pytorch) are built ag
 pip install -e . --force-reinstall
 ```
 
-### poetry.lock (optional — reproducible installs)
-A `poetry.lock` file pins every transitive dependency to the exact tested version. To generate one:
-
-```bash
-pip install poetry
-# Make sure pyproject.toml is present, then:
-poetry lock
-```
-
-Commit `poetry.lock` to the repo. Collaborators can then run `poetry install` to reproduce your exact environment. This is most useful for long-term reproducibility; for day-to-day use the `pip install -e .` approach is simpler.
+### poetry.lock (reproducible installs)
+A `poetry.lock` file pins every transitive dependency to the exact tested version. A lock file, `poetry.lock`, is included here. You can run `poetry install` to reproduce the exact tested environment. 
 
 ### Mean/std JSON path on Windows
 The stats are written to `artifacts/normalization/` in the working directory.
