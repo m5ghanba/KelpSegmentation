@@ -381,12 +381,14 @@ def split_random(
     image_files: List[str] = []
     mask_files:  List[str] = []
     for folder in folders:
-        sub_files = sorted(glob.glob(os.path.join(folder, "*")))
-        if len(sub_files) >= 2:
-            image_files.extend(sorted(glob.glob(os.path.join(sub_files[0], "*"))))
-            mask_files.extend( sorted(glob.glob(os.path.join(sub_files[1], "*"))))
+        img_dir = os.path.join(folder, "images")
+        mask_dir = os.path.join(folder, "masks")
+
+        if os.path.isdir(img_dir) and os.path.isdir(mask_dir):
+            image_files.extend(sorted(glob.glob(os.path.join(img_dir, "*"))))
+            mask_files.extend(sorted(glob.glob(os.path.join(mask_dir, "*"))))
         else:
-            print(f"[WARNING] Folder {folder!r} has unexpected structure; skipping.")
+            print(f"[WARNING] Folder {folder!r} missing images/ or masks/; skipping.")
 
     if len(image_files) != len(mask_files):
         raise ValueError("Global image/mask count mismatch.")
