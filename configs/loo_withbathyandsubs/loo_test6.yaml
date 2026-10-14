@@ -1,0 +1,71 @@
+data:
+  data_root: C:/Annotated Dataset/L2A Data/Test_Tiles_afterRSPaperrevision/*
+  split_strategy: loo
+  geographic:
+    train_frac: 0.7
+    val_frac: 0.15
+  random:
+    val_frac: 0.0015
+    test_frac: 0.0015
+  loo:
+    test_indices:
+    - 6
+    val_frac: 0.2
+  random_seed: 42
+  band_names:
+  - blue
+  - green
+  - red
+  - nir
+  - rededge
+  vi_names:
+  - ndvi
+  - ndwi
+  - gndvi
+  - clgreen
+  - ndvire
+  compute_mean_std: true
+  batch_size: 8
+  num_workers: 8
+model:
+  architecture: Unet
+  encoder: tu-maxvit_tiny_tf_512
+  encoder_weights: imagenet
+  out_classes: 1
+training:
+  epochs: 50
+  lr: 0.0002
+  eta_min: 1.0e-05
+  weight_decay: 0.0001
+  optimizer: adam
+  patience: 10
+  loss: tversky
+  bce_weight: 0.5
+  dice_weight: 0.5
+  tversky_alpha: 0.3
+  tversky_beta: 0.7
+  threshold: 0.5
+  float32_matmul_precision: medium
+augmentation:
+  hflip_p: 0.5
+  vflip_p: 0.5
+  rotate90_p: 0.5
+  affine_p: 0.3
+checkpoints:
+  dir: checkpoints
+  monitor: valid_kelp_per_image_iou
+  mode: max
+  save_last_n_epochs: 0
+finetune:
+  enabled: false
+  checkpoint: checkpoints/best_model.ckpt
+  freeze_encoder: false
+  freeze_epochs: 10
+mlflow:
+  experiment_name: KelpSegmentation
+  tracking_uri: mlruns
+  run_name: null
+  log_model: false
+  tags:
+    project: kelp-monitoring
+    dataset: Sentinel-2

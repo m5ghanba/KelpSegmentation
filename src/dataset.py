@@ -3,6 +3,17 @@ src/dataset.py
 --------------
 PyTorch Dataset for kelp / no-kelp semantic segmentation on Sentinel-2 imagery,
 plus all data-split helpers (geographic folder-based, random tile-based, and LOO).
+
+CHANGES vs. the original (for the manuscript revision):
+  - `resolve_num_channels()` — single source of truth for in_channels, used by
+    both SatelliteDataset and the train.py / inference.py CLIs, so the
+    substrate-one-hot channel count can't drift out of sync between them.
+  - `SatelliteDataset(..., substrate_onehot=True)` — replaces the scalar
+    substrate channel with a K-class one-hot encoding (see class docstring).
+  - `split_loo(..., val_mode="scene", val_indices=[...])` — optional
+    scene-disjoint (leak-free) train/val split, alongside the original
+    tile-level shuffle ("val_mode='tile'", still the default, unchanged
+    behaviour / unchanged results for anything not opting in).
 """
 
 from __future__ import annotations
@@ -62,6 +73,32 @@ ALL_BAND_INDICES: Dict[str, int] = {
 # re-computed at runtime based on the loaded band order.
 VI_NAMES = ["ndvi", "ndwi", "gndvi", "clgreen", "ndvire"]
 
+# Substrate raster is categorical: RF source uses classes {1,2,3,4} (rock,
+# mixed sediment, sand, mud); 0 = no coastal-data coverage (sentinel fill
+# value, not a fifth substrate class). One-hot expansion covers only the
+# four valid classes — a no-data pixel is the all-zero row, distinguishable
+# from every real class by construction.
+DEFAULT_SUBSTRATE_CLASSES: Tuple[int, ...] = (1, 2, 3, 4)
+
+
+def resolve_num_channels(
+    band_names: Sequence[str],
+    vi_names: Sequence[str],
+    substrate_onehot: bool = False,
+    n_substrate_classes: int = len(DEFAULT_SUBSTRATE_CLASSES),
+) -> int:
+    """
+    Single source of truth for model in_channels, so train.py / inference.py
+    and SatelliteDataset can never disagree on the channel count.
+
+    `band_names` must NOT include "substrate" when substrate_onehot=True
+    (the one-hot channels replace it) — see SatelliteDataset docstring.
+    """
+    n = len(band_names) + len(vi_names)
+    if substrate_onehot:
+        n += n_substrate_classes
+    return n
+
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -90,6 +127,22 @@ class SatelliteDataset(BaseDataset):
         ["blue","green","red","nir","rededge","substrate","bathymetry","slope"].
     vi_names : list of str, optional
         Which vegetation indices to append.  Defaults to all five.
+    substrate_onehot : bool
+        If True, read the substrate band separately from `band_names` (which
+        must therefore NOT contain "substrate") and append a K-channel
+        one-hot encoding (see `substrate_classes`) at the END of the channel
+        stack, after raw bands and after vegetation indices. Default False
+        (original scalar-substrate-channel behaviour, unchanged).
+    substrate_classes : sequence of int
+        Which raw substrate values become one-hot channels, in order. Default
+        (1, 2, 3, 4) — the four RF substrate classes. Value 0 (no coastal
+        coverage) is intentionally excluded: it becomes the implicit
+        all-zero row.
+
+    Channel order in the returned (C, H, W) image, when substrate_onehot is
+    used: [raw bands in band_names order] + [VIs in vi_names order] +
+    [one-hot substrate channels in substrate_classes order].
+    Use `resolve_num_channels()` (module-level) to get the matching in_channels.
     """
 
     CLASSES = ["water", "kelp", "land"]
@@ -104,6 +157,8 @@ class SatelliteDataset(BaseDataset):
         std:  Optional[Sequence[float]] = None,
         band_names: Optional[List[str]] = None,
         vi_names:   Optional[List[str]] = None,
+        substrate_onehot: bool = False,
+        substrate_classes: Sequence[int] = DEFAULT_SUBSTRATE_CLASSES,
     ) -> None:
         self.image_paths = image_paths
         self.mask_paths  = mask_paths
@@ -119,7 +174,19 @@ class SatelliteDataset(BaseDataset):
         if band_names is None:
             band_names = list(ALL_BAND_INDICES.keys())
         self.band_names = band_names
+
+        self.substrate_onehot  = substrate_onehot
+        self.substrate_classes = list(substrate_classes)
+        if self.substrate_onehot and "substrate" in self.band_names:
+            raise ValueError(
+                "substrate_onehot=True expects 'substrate' to be excluded "
+                "from band_names — the one-hot channels replace the scalar "
+                "substrate band and are appended separately. Remove "
+                "'substrate' from band_names in the config."
+            )
+
         self.rasterio_bands = [ALL_BAND_INDICES[b] for b in band_names]
+        self._substrate_band_idx = ALL_BAND_INDICES["substrate"]
 
         # Which VIs to compute
         if vi_names is None:
@@ -146,12 +213,25 @@ class SatelliteDataset(BaseDataset):
         return len(self.image_paths)
 
     def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
-        # ---- Load raw bands ------------------------------------------------
+        # ---- Load raw bands (+ substrate band too, in one read, if onehot)---
+        combined_bands = list(self.rasterio_bands)
+        if self.substrate_onehot:
+            combined_bands = combined_bands + [self._substrate_band_idx]
+
         with rasterio.open(self.image_paths[index]) as src:
-            image = src.read(self.rasterio_bands)          # (C, H, W)
-        image_hwc = np.transpose(image, (1, 2, 0)).astype(np.float32)  # (H, W, C)
+            raw = src.read(combined_bands)               # (C[+1], H, W)
+        raw_hwc = np.transpose(raw, (1, 2, 0)).astype(np.float32)  # (H, W, C[+1])
+
+        if self.substrate_onehot:
+            image_hwc     = raw_hwc[..., :-1]
+            substrate_raw = raw_hwc[..., -1]
+        else:
+            image_hwc     = raw_hwc
+            substrate_raw = None
 
         # ---- Compute vegetation indices ------------------------------------
+        # (self._band_pos indexes only into band_names / image_hwc as built
+        #  above, so this is unaffected by whether substrate_onehot is set.)
         indices = []
         for vi_name in self.vi_names:
             calc = self._vi_calculators.get(vi_name)
@@ -159,6 +239,14 @@ class SatelliteDataset(BaseDataset):
                 indices.append(calc(image_hwc)[..., np.newaxis])
         if indices:
             image_hwc = np.concatenate([image_hwc] + indices, axis=-1)
+
+        # ---- One-hot substrate, appended last ------------------------------
+        if substrate_raw is not None:
+            onehot = np.stack(
+                [(substrate_raw == c).astype(np.float32) for c in self.substrate_classes],
+                axis=-1,
+            )
+            image_hwc = np.concatenate([image_hwc, onehot], axis=-1)
 
         # ---- Load & process mask -------------------------------------------
         mask = self._read_mask(self.mask_paths[index])
@@ -228,7 +316,11 @@ class SatelliteDataset(BaseDataset):
 
     @property
     def num_channels(self) -> int:
-        return len(self.band_names) + len(self.vi_names)
+        return resolve_num_channels(
+            self.band_names, self.vi_names,
+            substrate_onehot=self.substrate_onehot,
+            n_substrate_classes=len(self.substrate_classes),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -421,10 +513,11 @@ def split_loo(
     test_indices: List[int],
     val_frac:     float = 0.20,
     seed:         int   = 42,
+    val_mode:     str   = "tile",
+    val_indices:  Optional[List[int]] = None,
 ) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str]]:
     """
-    Hold out the scene folder(s) at ``test_indices`` as the test set; split
-    the remaining folders' tiles 80/20 into train / val at tile level.
+    Hold out the scene folder(s) at ``test_indices`` as the test set.
 
     Parameters
     ----------
@@ -434,9 +527,32 @@ def split_loo(
         Zero-based indices into the sorted folder list to use as test scenes.
         E.g. ``[3]`` for the fourth folder, ``[9, 1, 3]`` for three scenes.
     val_frac : float
-        Fraction of remaining tiles to use for validation (default 0.20).
+        Only used when val_mode="tile": fraction of remaining tiles used for
+        validation (default 0.20). When val_mode="scene" and val_indices is
+        not given, val_frac instead sets how many *whole scenes* (rounded,
+        minimum 1) are held out for validation.
     seed : int
-        Random seed.
+        Random seed. Governs both the tile-level shuffle (val_mode="tile")
+        and, when val_indices is not given, which scene(s) are chosen for
+        validation (val_mode="scene").
+    val_mode : {"tile", "scene"}
+        "tile" (default, ORIGINAL BEHAVIOUR — unchanged): pool all tiles
+        from every non-test scene, shuffle at tile level, and cut the last
+        val_frac fraction off as validation. Tiles from the same scene can
+        land in both train and validation (they overlap spatially by
+        design — 50% tile overlap within a scene), which is the leakage
+        reviewers flagged: it does not touch the reported *test* metrics
+        (test scenes are always fully disjoint), but it can make
+        checkpoint/early-stopping selection slightly optimistic.
+        "scene" (NEW, leak-free): hold out whole scene folder(s) for
+        validation instead, so train/val/test are all scene-disjoint.
+        Use `val_indices` to pick them explicitly (recommended, e.g. for
+        the fixed 7-train/1-val/2-test comparison split), or let `val_frac`
+        pick that many scenes deterministically via `seed`.
+    val_indices : list of int, optional
+        Only used when val_mode="scene". Zero-based folder indices (from
+        the same sorted folder list as test_indices) to use as validation
+        scenes. Must not overlap test_indices.
 
     Folder order reference (10-scene dataset):
         0:uws  1:uxr  2:uxq  3:uyq  4:ucu
@@ -450,26 +566,57 @@ def split_loo(
             f"test_indices {test_indices} out of range for {len(folders)} folders."
         )
 
-    test_folders     = [folders[i] for i in test_indices]
-    trainval_folders = [f for i, f in enumerate(folders) if i not in test_indices]
+    test_folders = [folders[i] for i in test_indices]
+    X_test, y_test = get_files_from_folders(test_folders)
 
-    X_test,    y_test    = get_files_from_folders(test_folders)
-    X_all,     y_all     = get_files_from_folders(trainval_folders)
+    if val_mode == "tile":
+        trainval_folders = [f for i, f in enumerate(folders) if i not in test_indices]
+        X_all, y_all = get_files_from_folders(trainval_folders)
 
-    # Shuffle at tile level
-    combined = list(zip(X_all, y_all))
-    random.seed(seed)
-    random.shuffle(combined)
-    X_all[:], y_all[:] = zip(*combined)  # type: ignore[assignment]
+        # Shuffle at tile level
+        combined = list(zip(X_all, y_all))
+        random.seed(seed)
+        random.shuffle(combined)
+        X_all[:], y_all[:] = zip(*combined)  # type: ignore[assignment]
 
-    split_idx = int((1.0 - val_frac) * len(X_all))
-    X_train, y_train = X_all[:split_idx],  y_all[:split_idx]
-    X_val,   y_val   = X_all[split_idx:],  y_all[split_idx:]
+        split_idx = int((1.0 - val_frac) * len(X_all))
+        X_train, y_train = X_all[:split_idx],  y_all[:split_idx]
+        X_val,   y_val   = X_all[split_idx:],  y_all[split_idx:]
+
+    elif val_mode == "scene":
+        remaining_indices = [i for i in range(len(folders)) if i not in test_indices]
+
+        if val_indices is not None:
+            if set(val_indices) & set(test_indices):
+                raise ValueError(
+                    f"val_indices {val_indices} overlaps test_indices {test_indices}."
+                )
+            chosen_val_indices = list(val_indices)
+        else:
+            n_val_folders = max(1, round(val_frac * len(remaining_indices)))
+            rng = random.Random(seed)
+            shuffled = remaining_indices[:]
+            rng.shuffle(shuffled)
+            chosen_val_indices = shuffled[:n_val_folders]
+
+        val_folders   = [folders[i] for i in chosen_val_indices]
+        train_folders = [
+            f for i, f in enumerate(folders)
+            if i not in test_indices and i not in chosen_val_indices
+        ]
+        X_train, y_train = get_files_from_folders(train_folders)
+        X_val,   y_val   = get_files_from_folders(val_folders)
+
+    else:
+        raise ValueError(f"Unknown val_mode: {val_mode!r}. Use 'tile' or 'scene'.")
 
     _check_counts({"train": (X_train, y_train),
                    "val":   (X_val,   y_val),
                    "test":  (X_test,  y_test)})
 
-    print(f"LOO split — test folders: {[os.path.basename(f) for f in test_folders]}")
+    print(f"LOO split (val_mode={val_mode!r}) — "
+          f"test folders: {[os.path.basename(f) for f in test_folders]}")
+    if val_mode == "scene":
+        print(f"  val folders: {[os.path.basename(folders[i]) for i in chosen_val_indices]}")
     print(f"  train: {len(X_train)}, val: {len(X_val)}, test: {len(X_test)}")
     return X_train, y_train, X_val, y_val, X_test, y_test

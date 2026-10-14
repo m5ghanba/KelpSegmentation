@@ -1,0 +1,60 @@
+data:
+  data_root: C:/Annotated Dataset/L2A Data/Test_Tiles_afterRSPaperrevision/*
+  split_strategy: loo
+  random_seed: 42
+  loo:
+    test_indices:
+    - 0
+    - 6
+    val_mode: scene
+    val_indices:
+    - 8
+  band_names:
+  - blue
+  - green
+  - red
+  - nir
+  - rededge
+  vi_names:
+  - ndvi
+  - ndwi
+  - gndvi
+  - clgreen
+  - ndvire
+  substrate_onehot: false
+  compute_mean_std: true
+  batch_size: 8
+  num_workers: 8
+model:
+  architecture: Unet
+  encoder: tu-maxvit_tiny_tf_512
+  out_classes: 1
+  encoder_weights: null
+training:
+  epochs: 50
+  lr: 0.0002
+  eta_min: 1.0e-05
+  loss: dice
+  optimizer: adam
+  weight_decay: 0.0001
+  threshold: 0.5
+  patience: 10
+  seed: 1
+augmentation:
+  mode: flip
+  hflip_p: 0.5
+  vflip_p: 0.5
+  rotate90_p: 0.5
+  affine_p: 0.3
+checkpoints:
+  dir: checkpoints\ablation\indices\bands_plus_indices_seed1
+  monitor: valid_kelp_per_image_iou
+  mode: max
+mlflow:
+  tracking_uri: mlruns
+  experiment_name: KelpSegmentation-Ablation
+  log_model: true
+  tags:
+    ablation_group: indices
+    variant: bands_plus_indices
+  run_name: indices__bands_plus_indices__seed1

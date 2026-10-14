@@ -28,6 +28,23 @@ Tiling merge methods
   weighted : Linear-fade weight map averaging of overlapping tile logits.
   halo     : Uses only the centre of each tile, discards border halo.
   max      : Element-wise maximum of overlapping binary predictions.
+
+CHANGES vs. the original (for the manuscript revision):
+  - Removed the unconditional substrate value 4→3 remap. That remap matched
+    the BoPs substrate scheme (3 classes, {1,2,3}), but this project reports
+    results using the RF substrate scheme exclusively (4 classes, {1,2,3,4}
+    — rock/mixed/sand/mud), which src/dataset.py's SatelliteDataset never
+    remapped either. Applying the remap here regardless of scheme silently
+    folded real "mud" pixels into "sand" at inference time only — training
+    tiles kept class 4 intact. If you ever reintroduce BoPs-substrate scenes,
+    handle the scheme difference explicitly (e.g. a `substrate_scheme` config
+    key), don't hardcode a remap for everyone.
+  - in_channels / channel assembly now delegates to
+    `src.dataset.resolve_num_channels` so this file and SatelliteDataset can't
+    drift out of sync on the channel count again.
+  - `load_scene()` and `resolve_in_channels()` gained `substrate_onehot`
+    support, mirroring SatelliteDataset, for running full-scene inference
+    with a model trained on the one-hot substrate ablation.
 """
 
 from __future__ import annotations
@@ -49,7 +66,12 @@ from tqdm import tqdm
 # ---- local imports ---------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.dataset import normalize_input_mean_std, SatelliteDataset
+from src.dataset import (
+    normalize_input_mean_std,
+    SatelliteDataset,
+    resolve_num_channels,
+    DEFAULT_SUBSTRATE_CLASSES,
+)
 from src.model import KelpSegmentationModel
 
 
@@ -64,9 +86,13 @@ def load_config(path: str) -> Dict[str, Any]:
 
 def resolve_in_channels(cfg: Dict[str, Any]) -> int:
     """Derive in_channels from band_names + vi_names, with optional override."""
-    n_bands = len(cfg["data"].get("band_names", []))
-    n_vis   = len(cfg["data"].get("vi_names",   []))
-    return cfg.get("model", {}).get("in_channels", n_bands + n_vis)
+    data_cfg = cfg["data"]
+    n = resolve_num_channels(
+        data_cfg.get("band_names", []),
+        data_cfg.get("vi_names", []),
+        substrate_onehot=data_cfg.get("substrate_onehot", False),
+    )
+    return cfg.get("model", {}).get("in_channels", n)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +149,8 @@ def load_scene(
     scene_dir:  str,
     band_names: List[str],
     vi_names:   List[str],
+    substrate_onehot:  bool = False,
+    substrate_classes: Tuple[int, ...] = DEFAULT_SUBSTRATE_CLASSES,
 ) -> Tuple[np.ndarray, Dict]:
     """
     Load exactly the bands listed in ``band_names``, compute the VIs in
@@ -130,25 +158,38 @@ def load_scene(
 
     Channel order in the output array mirrors ``SatelliteDataset.__getitem__``:
     raw bands in the order given by ``band_names``, then VIs in the order
-    given by ``vi_names``.
+    given by ``vi_names``, then (if substrate_onehot) one-hot substrate
+    channels appended last.
 
     Parameters
     ----------
     scene_dir  : path to one scene sub-folder
     band_names : list of band names, e.g. ["blue","green","red","nir","rededge"]
-                 Must match training config exactly.
+                 Must match training config exactly. Must NOT contain
+                 "substrate" when substrate_onehot=True (same contract as
+                 SatelliteDataset).
     vi_names   : list of VI names, e.g. ["ndvi","ndwi"]
+    substrate_onehot : if True, read the substrate band and append a
+                 one-hot encoding instead of expecting a scalar "substrate"
+                 entry in band_names.
+    substrate_classes : which raw substrate values become one-hot channels.
 
     Returns
     -------
-    image_hwc : np.ndarray  shape (H, W, len(band_names) + len(vi_names))
+    image_hwc : np.ndarray  shape (H, W, len(band_names) + len(vi_names) [+ K])
                 raw (un-normalized) float32 array
     metadata  : dict  rasterio profile from the 10 m file (for georeferenced output)
     """
+    if substrate_onehot and "substrate" in band_names:
+        raise ValueError(
+            "substrate_onehot=True expects 'substrate' to be excluded from "
+            "band_names — see src/dataset.py SatelliteDataset docstring."
+        )
+
     # ---- Determine which files are actually needed -------------------------
     need_10m     = any(b in _SPECTRAL_10M for b in band_names)
     need_20m     = "rededge"    in band_names
-    need_sub     = "substrate"  in band_names
+    need_sub     = substrate_onehot or ("substrate" in band_names)
     need_bathy   = "bathymetry" in band_names
     need_slope   = "slope"      in band_names
 
@@ -183,15 +224,19 @@ def load_scene(
     else:
         img_re = None
 
-    # ---- Substrate ----------------------------------------------------------
+    # ---- Substrate ------------------------------------------------------------
+    # RF substrate scheme only: valid classes {1,2,3,4} (rock, mixed sediment,
+    # sand, mud); 0 = no coastal-data coverage (sentinel fill, not a class).
+    # No remap — see module docstring.
+    substrate_raw = None
     if need_sub:
         path_sub = _find_file(scene_dir, "*_Substrate.tif")
         with rasterio.open(path_sub) as src:
-            substrate = src.read(1).astype(np.float32)
-        # Remap value 4 → 3 (matches SatelliteDataset behaviour)
-        substrate = np.where(substrate == 4, 3, substrate)[:, :, np.newaxis]
-    else:
-        substrate = None
+            substrate_raw = src.read(1).astype(np.float32)   # (H, W)
+
+    substrate = None
+    if substrate_raw is not None and not substrate_onehot:
+        substrate = substrate_raw[:, :, np.newaxis]
 
     # ---- Bathymetry ---------------------------------------------------------
     if need_bathy:
@@ -252,6 +297,14 @@ def load_scene(
 
     if vi_arrays:
         image_hwc = np.concatenate([image_hwc] + vi_arrays, axis=-1)
+
+    # ---- One-hot substrate, appended last (mirrors SatelliteDataset) --------
+    if substrate_onehot:
+        onehot = np.stack(
+            [(substrate_raw == c).astype(np.float32) for c in substrate_classes],
+            axis=-1,
+        )
+        image_hwc = np.concatenate([image_hwc, onehot], axis=-1)
 
     return image_hwc, metadata
 
@@ -315,8 +368,9 @@ def run_inference(
     """
     Run tiled inference on a full (H, W, C) scene image.
 
-    Normalization is applied per-tile (not globally), matching the notebook's
-    DatasetInference.generate_tiles → normalize_tile_mean_std flow.
+    The global training mean/std is applied tile-by-tile (not recomputed per
+    tile), matching the notebook's DatasetInference.generate_tiles →
+    normalize_tile_mean_std flow.
 
     Returns
     -------
@@ -375,7 +429,7 @@ def run_inference(
 
     for (ri, rj) in tqdm(coords, total=len(coords), desc="Predicting tiles"):
         tile = _extract_tile(image_hwc, ri, rj, tile_size, padding_mode)
-        # Per-tile normalization — matches notebook DatasetInference behaviour
+        # Per-tile application of the (global, training-set) mean/std
         tile = normalize_input_mean_std(tile, mean, std)
         t    = torch.from_numpy(tile).permute(2, 0, 1).unsqueeze(0).float()
         batch_tiles.append(t)
@@ -438,11 +492,13 @@ def main() -> None:
     vi_names    = data_cfg.get("vi_names", [
         "ndvi", "ndwi", "gndvi", "clgreen", "ndvire",
     ])
+    substrate_onehot = data_cfg.get("substrate_onehot", False)
     in_channels = resolve_in_channels(cfg)
 
-    print(f"Band names  : {band_names}")
-    print(f"VI names    : {vi_names}")
-    print(f"in_channels : {in_channels}")
+    print(f"Band names       : {band_names}")
+    print(f"VI names         : {vi_names}")
+    print(f"substrate_onehot : {substrate_onehot}")
+    print(f"in_channels      : {in_channels}")
 
     # ---- Normalization stats -----------------------------------------------
     mean = np.array(data_cfg["mean"], dtype=np.float32)
@@ -455,7 +511,8 @@ def main() -> None:
     if len(mean) != in_channels:
         raise ValueError(
             f"data.mean has {len(mean)} values but in_channels = {in_channels}. "
-            "Ensure mean/std match the band_names + vi_names configuration."
+            "Ensure mean/std match the band_names + vi_names (+ substrate_onehot) "
+            "configuration used during training."
         )
 
     # ---- Load model --------------------------------------------------------
@@ -499,7 +556,10 @@ def main() -> None:
         print(f"  Output   : {output_path}")
 
         try:
-            image_hwc, metadata = load_scene(folder, band_names, vi_names)
+            image_hwc, metadata = load_scene(
+                folder, band_names, vi_names,
+                substrate_onehot=substrate_onehot,
+            )
             print(f"  Scene shape (H, W, C): {image_hwc.shape}")
 
             predictions = run_inference(

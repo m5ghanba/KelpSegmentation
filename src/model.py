@@ -17,6 +17,14 @@ Metrics reported per epoch
   Kelp class    : per-image IoU, dataset IoU, precision, recall, F1
   Background    : same (derived by swapping tp/tn/fp/fn)
   Overall       : pixel accuracy
+
+CHANGE vs. the original: `focal_dice` previously called
+`smp.losses.FocalLoss(torch.sigmoid(pred), target)` — but `smp.losses.FocalLoss`
+expects raw logits (it applies its own internal sigmoid/softmax), so this was
+a double sigmoid that silently miscalibrated the focal term's gradient. Fixed
+to pass logits directly, matching every other loss in this file. If you have
+any prior focal_dice results, they were computed under the buggy version —
+rerun before trusting/reporting them.
 """
 
 from __future__ import annotations
@@ -65,10 +73,16 @@ def build_loss(loss_name: str, **kwargs) -> nn.Module:
         return smp.losses.JaccardLoss(smp.losses.BINARY_MODE, from_logits=True)
 
     elif loss_name == "focal_dice":
+        focal_w = kwargs.get("focal_weight", 0.5)
+        dice_w  = kwargs.get("dice_weight",  0.5)
+        # NOTE: smp.losses.FocalLoss expects raw logits (from_logits handling
+        # is internal to the loss) — do NOT pre-apply sigmoid here. The
+        # original code passed torch.sigmoid(pred), which was a double
+        # sigmoid bug; fixed below.
         focal = smp.losses.FocalLoss(mode="binary")
         dice  = smp.losses.DiceLoss(mode="binary", from_logits=True)
         def combined(pred, target):
-            return 0.5 * dice(pred, target) + 0.5 * focal(torch.sigmoid(pred), target)
+            return dice_w * dice(pred, target) + focal_w * focal(pred, target)
         return combined  # type: ignore[return-value]
 
     else:

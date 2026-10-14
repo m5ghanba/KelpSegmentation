@@ -18,6 +18,26 @@ What this script does
 6. Trains with early stopping and model checkpointing.
 7. Runs test-set evaluation after training.
 8. Logs all hyperparameters, metrics, and the best checkpoint to MLflow.
+
+CHANGES vs. the original (for the manuscript revision):
+  - `training.seed` (default 42) is now applied via `pl.seed_everything()`,
+    SEPARATELY from `data.random_seed`. This lets you hold the data split
+    perfectly fixed (same data.random_seed / same loo.test_indices /
+    loo.val_indices) while varying only model init + dataloader shuffling +
+    augmentation randomness across `training.seed` — exactly what the
+    multi-seed comparison tables (indices, substrate encoding, loss,
+    augmentation, architecture, pretrained-vs-scratch) need. Before this
+    change there was no explicit seeding at all outside of `random.seed()`
+    inside the split functions, so repeated runs of the same config were not
+    actually reproducible in model init / shuffling.
+  - `data.loo.val_mode` ("tile", default, or "scene") and `data.loo.val_indices`
+    are now passed through to `split_loo()` — see src/dataset.py for the
+    leak-free scene-disjoint validation option.
+  - `data.substrate_onehot` is passed through to SatelliteDataset; in_channels
+    resolution now delegates to `src.dataset.resolve_num_channels` so it can
+    never disagree with what SatelliteDataset actually produces.
+  - `augmentation.mode` ("flip", "flip_rot90", "flip_affine") is passed
+    through to `get_training_augmentation()`.
 """
 
 from __future__ import annotations
@@ -50,6 +70,7 @@ from src.dataset import (
     split_geographic,
     split_random,
     split_loo,
+    resolve_num_channels,
 )
 from src.model import KelpSegmentationModel
 from src.transforms import get_training_augmentation, get_validation_augmentation
@@ -65,11 +86,15 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def resolve_in_channels(cfg: Dict[str, Any]) -> int:
-    """Derive in_channels from band_names + vi_names in data config."""
-    n_bands = len(cfg["data"].get("band_names", []))
-    n_vis   = len(cfg["data"].get("vi_names",   []))
+    """Derive in_channels from band_names + vi_names (+ substrate_onehot) in data config."""
+    data_cfg = cfg["data"]
+    n = resolve_num_channels(
+        data_cfg.get("band_names", []),
+        data_cfg.get("vi_names",   []),
+        substrate_onehot=data_cfg.get("substrate_onehot", False),
+    )
     # Allow explicit override
-    return cfg.get("model", {}).get("in_channels", n_bands + n_vis)
+    return cfg.get("model", {}).get("in_channels", n)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +130,8 @@ def build_splits(cfg: Dict[str, Any]):
             test_indices=loo["test_indices"],
             val_frac=loo.get("val_frac", 0.20),
             seed=seed,
+            val_mode=loo.get("val_mode", "tile"),
+            val_indices=loo.get("val_indices", None),
         )
     else:
         raise ValueError(f"Unknown split_strategy: {strategy!r}")
@@ -123,19 +150,30 @@ def train(cfg: Dict[str, Any]) -> None:
     ckpt_cfg   = cfg.get("checkpoints", {})
     mlflow_cfg = cfg.get("mlflow", {})
 
+    # ---- Seeding ------------------------------------------------------------
+    # Deliberately separate from data_cfg["random_seed"]: that seed controls
+    # WHICH tiles/scenes go into train/val/test (must stay fixed across a
+    # multi-seed comparison run); training.seed controls model init,
+    # dataloader shuffling, and augmentation randomness (the thing you
+    # actually want to vary across seeds 1/2/3 while holding the split fixed).
+    training_seed = train_cfg.get("seed", 42)
+    pl.seed_everything(training_seed, workers=True)
+
     torch.set_float32_matmul_precision(
         train_cfg.get("float32_matmul_precision", "high")
     )
 
-    band_names = data_cfg.get("band_names", None)
-    vi_names   = data_cfg.get("vi_names",   None)
-    in_channels = resolve_in_channels(cfg)
+    band_names       = data_cfg.get("band_names", None)
+    vi_names         = data_cfg.get("vi_names",   None)
+    substrate_onehot = data_cfg.get("substrate_onehot", False)
+    in_channels      = resolve_in_channels(cfg)
 
     # ------------------------------------------------------------------ splits
     X_train, y_train, X_val, y_val, X_test, y_test = build_splits(cfg)
 
     # ------------------------------------------------------------------ augmentation
     train_aug = get_training_augmentation(
+        mode=aug_cfg.get("mode", "flip"),
         hflip_p=aug_cfg.get("hflip_p",    0.5),
         vflip_p=aug_cfg.get("vflip_p",    0.5),
         rotate90_p=aug_cfg.get("rotate90_p", 0.5),
@@ -151,6 +189,7 @@ def train(cfg: Dict[str, Any]) -> None:
             classes=["kelp"],
             band_names=band_names,
             vi_names=vi_names,
+            substrate_onehot=substrate_onehot,
         )
         mean, std = compute_dataset_mean_std(
             temp_ds,
@@ -179,6 +218,7 @@ def train(cfg: Dict[str, Any]) -> None:
         mean=mean, std=std,
         band_names=band_names,
         vi_names=vi_names,
+        substrate_onehot=substrate_onehot,
     )
     val_ds = SatelliteDataset(
         X_val, y_val,
@@ -187,6 +227,7 @@ def train(cfg: Dict[str, Any]) -> None:
         mean=mean, std=std,
         band_names=band_names,
         vi_names=vi_names,
+        substrate_onehot=substrate_onehot,
     )
     test_ds = SatelliteDataset(
         X_test, y_test,
@@ -195,6 +236,7 @@ def train(cfg: Dict[str, Any]) -> None:
         mean=mean, std=std,
         band_names=band_names,
         vi_names=vi_names,
+        substrate_onehot=substrate_onehot,
     )
 
     bs = data_cfg.get("batch_size", 8)
@@ -331,6 +373,11 @@ def train(cfg: Dict[str, Any]) -> None:
 
     run_name = mlflow_cfg.get("run_name", None)
     tags     = mlflow_cfg.get("tags", {}) or {}
+    # Always tag the training seed and data-split seed, even if the config's
+    # own `mlflow.tags` doesn't mention them — makes it trivial to group runs
+    # by "same split, different seed" later without re-parsing every config.
+    tags = {**tags, "training_seed": str(training_seed),
+            "data_random_seed": str(data_cfg.get("random_seed", 42))}
 
     with mlflow.start_run(run_name=run_name, tags=tags) as run:
         # Log all config values as flat parameters
@@ -350,7 +397,7 @@ def train(cfg: Dict[str, Any]) -> None:
         # ---------------------------------------------------------------- train
         trainer = pl.Trainer(
             max_epochs=epochs,
-            callbacks=[checkpoint_cb, early_stop_cb],
+            callbacks=[checkpoint_cb, early_stop_cb] + extra_callbacks,
             logger=mlflow_logger,
             log_every_n_steps=1,
             enable_progress_bar=True,
@@ -370,6 +417,15 @@ def train(cfg: Dict[str, Any]) -> None:
         # Log the checkpoint as an artifact
         if best_ckpt and mlflow_cfg.get("log_model", False):
             mlflow.log_artifact(best_ckpt, artifact_path="checkpoints")
+        
+        # Save pth file as well.
+        if best_ckpt and os.path.isfile(best_ckpt):
+            checkpoint = torch.load(
+                best_ckpt, map_location="cpu", weights_only=False
+            )
+            best_pth = os.path.splitext(best_ckpt)[0] + ".pth"
+            torch.save(checkpoint["state_dict"], best_pth)
+            print(f"Best model weights saved: {best_pth}")
 
         print("\n── Test Results ─────────────────────────────")
         for k, v in (test_results[0] if test_results else {}).items():
